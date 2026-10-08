@@ -321,39 +321,67 @@
       return segmenter;
     }
 
-    // 高精度モデル(BiRefNet_lite、MITライセンス):最初の1回だけ読み込む
+    // 高精度モデル(BiRefNet_lite、MIT):最初の1回だけ読み込む
+    // GPU(WebGPU)が使えれば優先し、だめならCPU(WASM)で再挑戦する
     const PRECISE_IDS = ["onnx-community/BiRefNet_lite-ONNX", "onnx-community/BiRefNet_lite"];
     let precise = null;
-    async function getPrecise() {
-      if (precise) return precise;
-      setStatus("高精度モデルを読み込み中です(初回のみ・時間がかかります)…", "loading");
-      setProgress(0);
+    let stage = "";
+    function describeError(e) {
+      if (e instanceof Error && e.message) return e.message;
+      if (typeof e === "number") return "内部エラー(コード " + e + "。メモリ不足の可能性が高いです)";
+      try { return String(e); } catch (_) { return "不明なエラー"; }
+    }
+    async function loadPrecise(device) {
       let lastError = null;
       for (const id of PRECISE_IDS) {
         try {
-          const model = await AutoModel.from_pretrained(id, { dtype: "fp32", progress_callback: makeProgress() });
+          const model = await AutoModel.from_pretrained(id, { dtype: "fp32", device, progress_callback: makeProgress() });
           const processor = await AutoProcessor.from_pretrained(id);
-          precise = { model, processor };
-          break;
+          return { model, processor, device };
         } catch (e) {
-          console.warn("高精度モデルの読み込みに失敗:", id, e);
+          console.warn("高精度モデルの読み込みに失敗:", id, device, e);
           lastError = e;
         }
       }
-      setProgress(null);
-      if (!precise) throw lastError || new Error("高精度モデルを読み込めませんでした");
+      throw lastError || new Error("高精度モデルを読み込めませんでした");
+    }
+    async function getPrecise(device) {
+      if (precise && precise.device === device) return precise;
+      stage = "モデル読み込み(" + device + ")";
+      setStatus("高精度モデルを読み込み中です(初回のみ・時間がかかります)…", "loading");
+      setProgress(0);
+      try { precise = await loadPrecise(device); }
+      finally { setProgress(null); }
       return precise;
     }
-
-    // 高精度モデルで「どこが被写体か」のマスクを作り、元の画像の透明度にする
-    async function runPrecise(url, preparedBlob) {
-      const { model, processor } = await getPrecise();
+    async function inferPrecise(device, url) {
+      const { model, processor } = await getPrecise(device);
+      stage = "画像の推論(" + device + ")";
       setStatus("高精度で背景を消しています…(時間がかかります)", "loading");
       const image = await RawImage.fromURL(url);
       const { pixel_values } = await processor(image);
       const { output_image } = await model({ input_image: pixel_values });
       const mask = await RawImage.fromTensor(output_image[0].sigmoid().mul(255).to("uint8"))
         .resize(image.width, image.height);
+      return { image, mask };
+    }
+
+    // 高精度モデルで「どこが被写体か」のマスクを作り、元の画像の透明度にする
+    async function runPrecise(url, preparedBlob) {
+      const devices = navigator.gpu ? ["webgpu", "wasm"] : ["wasm"];
+      let result = null, lastError = null;
+      for (const device of devices) {
+        try {
+          result = await inferPrecise(device, url);
+          break;
+        } catch (e) {
+          console.error("高精度モードの失敗:", device, e);
+          lastError = e;
+          precise = null;                 // 壊れた可能性があるので作り直す
+        }
+      }
+      if (!result) throw lastError;
+      const { image, mask } = result;
 
       const bmp = await createImageBitmap(preparedBlob);
       const work = document.createElement("canvas");
@@ -424,6 +452,7 @@
       resultFrame.textContent = "処理中…";
 
       try {
+        stage = "画像の準備";
         const prepared = await prepareImage(file);
         const url = URL.createObjectURL(prepared);
         urls.push(url);
@@ -444,7 +473,7 @@
       } catch (error) {
         console.error(error);
         resultFrame.textContent = "ここに表示されます";
-        setStatus("エラーが出ました: " + error.message + "(画像が大きい、またはメモリ不足の可能性があります。小さい画像でもう一度試してください)", "error");
+        setStatus("エラーが出ました [" + (stage || "準備") + "]: " + describeError(error) + "(画像が大きい、またはメモリ不足の可能性があります。小さい画像でもう一度試してください)", "error");
       } finally {
         setProgress(null);
         busy = false;
