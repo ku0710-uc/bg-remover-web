@@ -116,6 +116,13 @@
       border-radius: 10px; overflow: hidden; background: var(--bg); color: var(--muted); font-size: .9rem;
     }
     .frame img { display: block; max-width: 100%; max-height: 480px; }
+    .frame canvas { display: block; max-width: 100%; max-height: 480px; width: auto; height: auto; }
+    .tune { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 14px; }
+    .tune label { color: var(--muted); font-size: .9rem; }
+    .tune input[type=range] { flex: 1 1 200px; min-width: 160px; height: 44px; accent-color: var(--accent); }
+    .tune output { min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
+    .tune input:disabled { opacity: .5; }
+    .tune .hint { flex-basis: 100%; margin: 0; color: var(--muted); font-size: .85rem; }
     .frame.checker { background: repeating-conic-gradient(#d8d8d8 0% 25%, #fff 0% 50%) 50% / 20px 20px; }
 
     .actions { margin-top: 12px; min-height: 40px; }
@@ -165,6 +172,13 @@
       </fieldset>
     </div>
 
+    <div class="tune">
+      <label for="strength">背景の消し具合</label>
+      <input id="strength" type="range" min="0" max="100" step="1" value="0" disabled />
+      <output id="strengthValue" for="strength">0</output>
+      <p class="hint">背景が半透明で残るときは、右へ動かします。右に寄せすぎると、被写体の細かい部分(髪の毛・ガラスなど)も消えることがあります。</p>
+    </div>
+
     <section class="results">
       <div class="card">
         <h2>元の画像</h2>
@@ -210,6 +224,44 @@
         canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("画像の変換に失敗しました"))), "image/png"));
       return blob;
     }
+
+    const strengthInput = $("strength"), strengthValue = $("strengthValue");
+    let baseData = null;          // モデルが出した元の結果(ピクセルの値)
+    let outCanvas = null;         // 画面に表示する結果
+    let downloadUrl = null;
+
+    // 半透明の部分を、しきい値で消す/はっきりさせる(0=そのまま)
+    function renderResult() {
+      if (!baseData || !outCanvas) return;
+      const s = Number(strengthInput.value) / 100;
+      const out = new ImageData(new Uint8ClampedArray(baseData.data), baseData.width, baseData.height);
+      if (s > 0) {
+        const cutoff = s * 0.75;     // この透明度より薄い部分は消える
+        const width = 0.25;          // 消える/残るの境目のなだらかさ
+        const d = out.data;
+        for (let i = 3; i < d.length; i += 4) {
+          const a = d[i] / 255;
+          const t = Math.min(1, Math.max(0, (a - cutoff) / width));
+          d[i] = Math.round(t * t * (3 - 2 * t) * 255);
+        }
+      }
+      outCanvas.getContext("2d").putImageData(out, 0, 0);
+    }
+    function updateDownload() {
+      if (!outCanvas) return;
+      outCanvas.toBlob((blob) => {
+        if (!blob) return;
+        if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+        downloadUrl = URL.createObjectURL(blob);
+        downloadLink.href = downloadUrl;
+        downloadLink.hidden = false;
+      }, "image/png");
+    }
+    strengthInput.addEventListener("input", () => {
+      strengthValue.textContent = strengthInput.value;
+      renderResult();
+    });
+    strengthInput.addEventListener("change", updateDownload);   // 動かし終わったら保存用の画像を作り直す
 
     let segmenter = null;
     let busy = false;
@@ -283,6 +335,9 @@
 
       urls.forEach((u) => URL.revokeObjectURL(u));
       urls = [];
+      if (downloadUrl) { URL.revokeObjectURL(downloadUrl); downloadUrl = null; }
+      baseData = null;
+      strengthInput.disabled = true;
       downloadLink.hidden = true;
       resultFrame.textContent = "処理中…";
 
@@ -297,12 +352,23 @@
         const output = await seg(url);
         const image = Array.isArray(output) ? output[0] : output;
         const blob = await image.toBlob();
-        const outUrl = URL.createObjectURL(blob);
-        urls.push(outUrl);
 
-        showImage(resultFrame, outUrl);
-        downloadLink.href = outUrl;
-        downloadLink.hidden = false;
+        // 結果をピクセルのデータとして取り出し、後から消し具合を変えられるようにする
+        const bmp = await createImageBitmap(blob);
+        const work = document.createElement("canvas");
+        work.width = bmp.width; work.height = bmp.height;
+        const wctx = work.getContext("2d");
+        wctx.drawImage(bmp, 0, 0);
+        baseData = wctx.getImageData(0, 0, bmp.width, bmp.height);
+        bmp.close();
+
+        outCanvas = document.createElement("canvas");
+        outCanvas.width = baseData.width; outCanvas.height = baseData.height;
+        resultFrame.textContent = "";
+        resultFrame.appendChild(outCanvas);
+        renderResult();
+        updateDownload();
+        strengthInput.disabled = false;
         applyBackground();
         setStatus("完了しました。", "");
       } catch (error) {
