@@ -164,6 +164,15 @@
 
     <div class="options">
       <fieldset>
+        <legend>精度</legend>
+        <label class="chip"><input type="radio" name="mode" value="standard" checked /><span>標準(軽い)</span></label>
+        <label class="chip"><input type="radio" name="mode" value="precise" /><span>高精度(重い)</span></label>
+      </fieldset>
+    </div>
+    <p class="note" id="modeNote">高精度は、モデルが大きく(約200MB以上)、初回の読み込みと処理に時間がかかります。スマホではメモリ不足で動かないことがあります。</p>
+
+    <div class="options">
+      <fieldset>
         <legend>表示する背景の色</legend>
         <label class="chip"><input type="radio" name="bg" value="checker" checked /><span><i class="swatch checker"></i>透明</span></label>
         <label class="chip"><input type="radio" name="bg" value="#ffffff" /><span><i class="swatch" style="background:#fff"></i>白</span></label>
@@ -197,7 +206,7 @@
   </div>
 
   <script type="module">
-    import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+    import { pipeline, AutoModel, AutoProcessor, RawImage } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
 
     const $ = (id) => document.getElementById(id);
     const drop = $("drop"), fileInput = $("file");
@@ -284,27 +293,98 @@
       frame.appendChild(img);
     }
 
-    // AIモデルは最初の1回だけ読み込む。ダウンロードの進み具合を表示する
+    // ダウンロードの進み具合を表示する
+    function makeProgress() {
+      const files = {};
+      return (info) => {
+        if (info.status === "progress" && info.total) {
+          files[info.file] = { loaded: info.loaded, total: info.total };
+          let loaded = 0, total = 0;
+          for (const f of Object.values(files)) { loaded += f.loaded; total += f.total; }
+          const pct = total ? (loaded / total) * 100 : 0;
+          setProgress(pct);
+          setStatus(`AIモデルをダウンロード中… ${Math.round(pct)}%`, "loading");
+        }
+      };
+    }
+
+    // 標準モデル(RMBG-1.4):最初の1回だけ読み込む
     async function getSegmenter() {
       if (segmenter) return segmenter;
-      const files = {};
       setStatus("AIモデルを読み込み中です(初回のみ)…", "loading");
       setProgress(0);
       segmenter = await pipeline("background-removal", "briaai/RMBG-1.4", {
         dtype: "fp32",
-        progress_callback: (info) => {
-          if (info.status === "progress" && info.total) {
-            files[info.file] = { loaded: info.loaded, total: info.total };
-            let loaded = 0, total = 0;
-            for (const f of Object.values(files)) { loaded += f.loaded; total += f.total; }
-            const pct = total ? (loaded / total) * 100 : 0;
-            setProgress(pct);
-            setStatus(`AIモデルをダウンロード中… ${Math.round(pct)}%`, "loading");
-          }
-        },
+        progress_callback: makeProgress(),
       });
       setProgress(null);
       return segmenter;
+    }
+
+    // 高精度モデル(BiRefNet_lite、MITライセンス):最初の1回だけ読み込む
+    const PRECISE_IDS = ["onnx-community/BiRefNet_lite-ONNX", "onnx-community/BiRefNet_lite"];
+    let precise = null;
+    async function getPrecise() {
+      if (precise) return precise;
+      setStatus("高精度モデルを読み込み中です(初回のみ・時間がかかります)…", "loading");
+      setProgress(0);
+      let lastError = null;
+      for (const id of PRECISE_IDS) {
+        try {
+          const model = await AutoModel.from_pretrained(id, { dtype: "fp32", progress_callback: makeProgress() });
+          const processor = await AutoProcessor.from_pretrained(id);
+          precise = { model, processor };
+          break;
+        } catch (e) {
+          console.warn("高精度モデルの読み込みに失敗:", id, e);
+          lastError = e;
+        }
+      }
+      setProgress(null);
+      if (!precise) throw lastError || new Error("高精度モデルを読み込めませんでした");
+      return precise;
+    }
+
+    // 高精度モデルで「どこが被写体か」のマスクを作り、元の画像の透明度にする
+    async function runPrecise(url, preparedBlob) {
+      const { model, processor } = await getPrecise();
+      setStatus("高精度で背景を消しています…(時間がかかります)", "loading");
+      const image = await RawImage.fromURL(url);
+      const { pixel_values } = await processor(image);
+      const { output_image } = await model({ input_image: pixel_values });
+      const mask = await RawImage.fromTensor(output_image[0].sigmoid().mul(255).to("uint8"))
+        .resize(image.width, image.height);
+
+      const bmp = await createImageBitmap(preparedBlob);
+      const work = document.createElement("canvas");
+      work.width = image.width; work.height = image.height;
+      const wctx = work.getContext("2d");
+      wctx.drawImage(bmp, 0, 0, work.width, work.height);
+      bmp.close();
+      const data = wctx.getImageData(0, 0, work.width, work.height);
+      const m = mask.data;                       // 1チャンネル(0〜255)
+      const channels = mask.channels || 1;
+      for (let i = 0, j = 3; i < work.width * work.height; i++, j += 4) {
+        data.data[j] = m[i * channels];
+      }
+      return data;
+    }
+
+    // 標準モデルの結果をピクセルのデータにする
+    async function runStandard(url) {
+      const seg = await getSegmenter();
+      setStatus("背景を消しています…", "loading");
+      const output = await seg(url);
+      const image = Array.isArray(output) ? output[0] : output;
+      const blob = await image.toBlob();
+      const bmp = await createImageBitmap(blob);
+      const work = document.createElement("canvas");
+      work.width = bmp.width; work.height = bmp.height;
+      const wctx = work.getContext("2d");
+      wctx.drawImage(bmp, 0, 0);
+      const data = wctx.getImageData(0, 0, bmp.width, bmp.height);
+      bmp.close();
+      return data;
     }
 
     // 表示する背景の色を切り替える(保存されるPNGは透明のまま)
@@ -320,6 +400,7 @@
     }
     document.querySelectorAll('input[name="bg"]').forEach((r) => r.addEventListener("change", applyBackground));
 
+    let lastFile = null;
     async function handleFile(file) {
       if (!file) return;
       if (!file.type.startsWith("image/")) {
@@ -330,6 +411,7 @@
         setStatus("処理中です。完了してからもう一度選んでください。", "error");
         return;
       }
+      lastFile = file;
       busy = true;
       drop.classList.add("busy");
 
@@ -347,20 +429,8 @@
         urls.push(url);
         showImage(originalFrame, url);
 
-        const seg = await getSegmenter();
-        setStatus("背景を消しています…", "loading");
-        const output = await seg(url);
-        const image = Array.isArray(output) ? output[0] : output;
-        const blob = await image.toBlob();
-
-        // 結果をピクセルのデータとして取り出し、後から消し具合を変えられるようにする
-        const bmp = await createImageBitmap(blob);
-        const work = document.createElement("canvas");
-        work.width = bmp.width; work.height = bmp.height;
-        const wctx = work.getContext("2d");
-        wctx.drawImage(bmp, 0, 0);
-        baseData = wctx.getImageData(0, 0, bmp.width, bmp.height);
-        bmp.close();
+        const mode = document.querySelector('input[name="mode"]:checked').value;
+        baseData = mode === "precise" ? await runPrecise(url, prepared) : await runStandard(url);
 
         outCanvas = document.createElement("canvas");
         outCanvas.width = baseData.width; outCanvas.height = baseData.height;
@@ -384,6 +454,10 @@
     }
 
     fileInput.addEventListener("change", () => handleFile(fileInput.files[0]));
+
+    // 精度を切り替えたら、同じ画像でやり直す
+    document.querySelectorAll('input[name="mode"]').forEach((r) =>
+      r.addEventListener("change", () => { if (lastFile && !busy) handleFile(lastFile); }));
 
     // ドラッグ&ドロップ
     ["dragenter", "dragover"].forEach((type) =>
